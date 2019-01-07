@@ -8,12 +8,18 @@ import (
 	"crypto/rc4"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net"
 	"net/http"
+	"os"
+	"os/user"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -64,12 +70,80 @@ func Gravity(conn io.ReadWriteCloser, k []byte) io.ReadWriteCloser {
 	}
 }
 
+// Open a file from URL or cache with expiration.
+func OpenFile(furl string, name string, ex time.Duration) (io.ReadCloser, error) {
+	var (
+		res *http.Response
+		f   *os.File
+		fin os.FileInfo
+		raw []byte
+		err error
+	)
+	if furl == "" && name == "" {
+		return nil, errors.New("daze: furl/name does not specified")
+	}
+	if furl != "" && name == "" {
+		res, err = http.Get(furl)
+		if err != nil {
+			return nil, err
+		}
+		return res.Body, nil
+	}
+	if furl == "" && name != "" {
+		return os.Open(name)
+	}
+	fin, err = os.Stat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			goto HERE
+		}
+		return nil, err
+	}
+	if time.Since(fin.ModTime()) > ex {
+		goto HERE
+	}
+	goto NEXT
+HERE:
+	res, err = http.Get(furl)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, err = ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	f, err = os.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	_, err = f.Write(raw)
+	if err != nil {
+		return nil, err
+	}
+NEXT:
+	f, err = os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// Kiss a file from URL or local.
+func KissFile(furl string) (io.ReadCloser, error) {
+	if strings.HasPrefix(furl, "http") {
+		return OpenFile(furl, "", time.Duration(0))
+	}
+	return OpenFile("", furl, time.Duration(0))
+}
+
 // Resolve modifies the net.DefaultResolver(which is the resolver used by the
 // package-level Lookup functions and by Dialers without a specified Resolver).
 //
 // Examples:
 //   Resolve("8.8.8.8:53")
-//	 Resolve("114.114.114.114:53")
+//   Resolve("114.114.114.114:53")
 func Resolve(addr string) {
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
@@ -108,6 +182,13 @@ type NetBox struct {
 // Add a new *net.IPNet into NetBox.
 func (n *NetBox) Add(ipNet *net.IPNet) {
 	n.L = append(n.L, ipNet)
+}
+
+// Mrg is short for "Merge".
+func (n *NetBox) Mrg(box *NetBox) {
+	for _, e := range box.L {
+		n.Add(e)
+	}
 }
 
 // Whether ip is in the collection.
@@ -176,122 +257,270 @@ func IPv6ReservedIPNet() *NetBox {
 	return netBox
 }
 
-// CNIPNet returns full ipv4 CIDR in CN.
+// CNIPNet returns full ipv4/6 CIDR in CN.
 func CNIPNet() *NetBox {
-	r, err := http.Get("http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest")
+	furl := "http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
+	name := filepath.Join(Data(), "delegated-apnic-latest")
+	f, err := OpenFile(furl, name, time.Hour*24*64)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer r.Body.Close()
-
+	defer f.Close()
 	netBox := &NetBox{}
-	s := bufio.NewScanner(r.Body)
+	s := bufio.NewScanner(f)
 	for s.Scan() {
 		line := s.Text()
-		if !strings.HasPrefix(line, "apnic|CN|ipv4") {
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		seps := strings.Split(line, "|")
-		sep4, err := strconv.Atoi(seps[4])
-		if err != nil {
-			log.Fatalln(err)
+		switch {
+		case strings.HasPrefix(line, "apnic|CN|ipv4"):
+			seps := strings.Split(line, "|")
+			sep4, err := strconv.Atoi(seps[4])
+			if err != nil {
+				log.Fatalln(err)
+			}
+			mask := 32 - int(math.Log2(float64(sep4)))
+			_, cidr, err := net.ParseCIDR(fmt.Sprintf("%s/%d", seps[3], mask))
+			if err != nil {
+				log.Fatalln(err)
+			}
+			netBox.Add(cidr)
+		case strings.HasPrefix(line, "apnic|CN|ipv6"):
+			seps := strings.Split(line, "|")
+			sep4 := seps[4]
+			_, cidr, err := net.ParseCIDR(fmt.Sprintf("%s/%s", seps[3], sep4))
+			if err != nil {
+				log.Fatalln(err)
+			}
+			netBox.Add(cidr)
 		}
-		mask := 32 - int(math.Log2(float64(sep4)))
-		_, cidr, err := net.ParseCIDR(fmt.Sprintf("%s/%d", seps[3], mask))
-		if err != nil {
-			log.Fatalln(err)
-		}
-		netBox.Add(cidr)
 	}
 	return netBox
 }
 
-// NewFilterIP returns a FilterIP.
-func NewFilterIP(dialer Dialer) *FilterIP {
-	f := &FilterIP{
-		Client: dialer,
-		Netbox: NetBox{},
+const (
+	RoadLocale = 0x00
+	RoadRemote = 0x01
+	RoadFucked = 0x02
+	RoadUnknow = 0x09
+)
+
+// Roader is the interface that groups the basic Road method.
+type Roader interface {
+	Road(host string) int
+}
+
+// NewRoaderRule returns a new RoaderRule.
+func NewRoaderRule() *RoaderRule {
+	return &RoaderRule{
+		Host: map[string]string{},
+		Rule: map[string]int{},
 	}
-	f.Join(IPv4ReservedIPNet())
-	f.Join(IPv6ReservedIPNet())
-	return f
+}
+
+// RoaderRule routing based on the RULE file.
+//
+// RULE file aims to be a minimal configuration file format that's easy to
+// read due to obvious semantics.
+// There are two parts per line on RULE file: road and glob. road are on the
+// left of the space sign and glob are on the right. road is an int and
+// describes whether the host should go proxy, glob supported glob-style
+// patterns:
+//   h?llo matches hello, hallo and hxllo
+//   h*llo matches hllo and heeeello
+//   h[ae]llo matches hello and hallo, but not hillo
+//   h[^e]llo matches hallo, hbllo, ... but not hello
+//   h[a-b]llo matches hallo and hbllo
+//
+// This is a RULE document:
+//   F a.com b.com
+//   L a.com
+//   R b.com
+//   B c.com
+//
+// F(orward) means using b.com instead of a.com
+// L(ocale)  means using local network
+// R(emote)  means using proxy
+// B(anned)  means block it
+type RoaderRule struct {
+	Host map[string]string
+	Rule map[string]int
+}
+
+// Road.
+func (r *RoaderRule) Road(host string) int {
+	for p, i := range r.Rule {
+		b, err := filepath.Match(p, host)
+		if err != nil || !b {
+			continue
+		}
+		return i
+	}
+	return RoadUnknow
+}
+
+// Load a RULE file.
+func (r *RoaderRule) Load(name string) error {
+	f, err := KissFile(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		seps := strings.Split(line, " ")
+		if len(seps) < 2 {
+			continue
+		}
+		switch seps[0] {
+		case "#":
+		case "F":
+			r.Host[seps[1]] = seps[2]
+		case "L":
+			for _, e := range seps[1:] {
+				r.Rule[e] = RoadLocale
+			}
+		case "R":
+			for _, e := range seps[1:] {
+				r.Rule[e] = RoadRemote
+			}
+		case "B":
+			for _, e := range seps[1:] {
+				r.Rule[e] = RoadFucked
+			}
+		}
+	}
+	return scanner.Err()
+}
+
+// NewRoaderIP returns a new RoaderIP.
+func NewRoaderIP(in, no int) *RoaderIP {
+	return &RoaderIP{
+		NetBox: NetBox{},
+		In:     in,
+		No:     no,
+	}
+}
+
+// RoaderRule routing based on the IP.
+type RoaderIP struct {
+	NetBox NetBox
+	In     int
+	No     int
+}
+
+// Road.
+func (r *RoaderIP) Road(host string) int {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return RoadUnknow
+	}
+	if r.NetBox.Has(ips[0]) {
+		return r.In
+	}
+	return r.No
+}
+
+// NewRoaderBull returns a new RoaderBull.
+func NewRoaderBull(road int) *RoaderBull {
+	return &RoaderBull{
+		Path: road,
+	}
+}
+
+// RoaderBull routing based on ... wow, it is stubborn like a bull, it always
+// heads in one direction and do nothing.
+type RoaderBull struct {
+	Path int
+}
+
+// Road.
+func (r *RoaderBull) Road(host string) int {
+	return r.Path
+}
+
+// NewFilter returns a Filter. The poor Nier doesn't have enough brain
+// capacity, it can only remember 2048 addresses(Because LRU is used to avoid
+// memory transition expansion).
+func NewFilter(dialer Dialer) *Filter {
+	return &Filter{
+		Client: dialer,
+		Namedb: acdb.Lru(2048),
+		Roader: []Roader{},
+	}
 }
 
 // Filter determines whether the traffic should uses the proxy based on the
-// destination's IP address.
-type FilterIP struct {
+// destination's IP address or domain.
+type Filter struct {
 	Client Dialer
-	Netbox NetBox
+	Namedb acdb.Client
+	Host   map[string]string
+	Roader []Roader
 }
 
-// Join adds the IPNet of n.
-func (f *FilterIP) Join(n *NetBox) {
-	for _, e := range n.L {
-		f.Netbox.Add(e)
-	}
+// JoinRoader.
+func (f *Filter) JoinRoader(roader Roader) {
+	f.Roader = append(f.Roader, roader)
 }
 
 // Dial connects to the address on the named network. If necessary, Filter
 // will use f.Client.Dial, else net.Dial instead.
-func (f *FilterIP) Dial(network, address string) (io.ReadWriteCloser, error) {
-	host, _, err := net.SplitHostPort(address)
+func (f *Filter) Dial(network, address string) (io.ReadWriteCloser, error) {
+	var (
+		host string
+		port string
+		road int
+		err  error
+	)
+	host, port, err = net.SplitHostPort(address)
+	if cure, ok := f.Host[host]; ok {
+		host = cure
+		address = host + ":" + port
+	}
 	if err != nil {
 		return nil, err
 	}
-	ipls, err := net.LookupIP(host)
-	if err != nil {
-		return net.Dial(network, address)
+	err = f.Namedb.Get(host, &road)
+	if err == nil {
+		switch road {
+		case RoadLocale:
+			return net.Dial(network, address)
+		case RoadRemote:
+			return f.Client.Dial(network, address)
+		}
 	}
-	if f.Netbox.Has(ipls[0]) {
-		return net.Dial(network, address)
+	if err != acdb.ErrNotExist {
+		return nil, err
 	}
-	conn, err := f.Client.Dial(network, address)
-	if err != nil {
-		return net.Dial(network, address)
+	for _, roader := range f.Roader {
+		road = roader.Road(host)
+		switch road {
+		case RoadLocale:
+			f.Namedb.SetNone(host, RoadLocale)
+			return net.Dial(network, address)
+		case RoadRemote:
+			f.Namedb.SetNone(host, RoadRemote)
+			return f.Client.Dial(network, address)
+		case RoadFucked:
+			return nil, fmt.Errorf("daze: %s has been blocked", host)
+		case RoadUnknow:
+			continue
+		}
 	}
-	return conn, nil
-}
-
-// NewFilterAuto returns a FilterAuto. The poor Nier doesn't have enough brain
-// capacity, it can only remember 1024 addresses(Because LRU is used to avoid
-// memory transition expansion).
-func NewFilterAuto(dialer Dialer) *FilterAuto {
-	return &FilterAuto{
-		Client: dialer,
-		Box:    acdb.LRU(1024),
-	}
-}
-
-// Filter determines whether the traffic should uses the proxy based on the
-// destination's IP address or domain. Different from FilterIP, FilterAuto
-// is a fuck smart monkey, it first tries to connect to the address using a
-// local connection, if it fails, will using the proxy instead. This
-// experience will be remembered by this monkey, so next time it sees the same
-// address again, Nier(I just gave it the name) will make a decision
-// immediately.
-type FilterAuto struct {
-	Client Dialer
-	Box    acdb.Client
-}
-
-// Dial connects to the address on the named network. If necessary, Filter
-// will use f.Client.Dial, else net.Dial instead.
-func (f *FilterAuto) Dial(network, address string) (io.ReadWriteCloser, error) {
-	var p bool
-	f.Box.Get(address, &p)
-	if p {
-		return f.Client.Dial(network, address)
-	}
-	connl, connlErr := net.DialTimeout(network, address, time.Second*2)
-	if connlErr == nil {
+	connl, err := net.DialTimeout(network, address, time.Second*4)
+	if err == nil {
+		f.Namedb.SetNone(host, RoadLocale)
 		return connl, nil
 	}
-	connr, connrErr := f.Client.Dial(network, address)
-	if connrErr == nil {
-		f.Box.Set(address, true)
+	connr, err := f.Client.Dial(network, address)
+	if err == nil {
+		f.Namedb.SetNone(host, RoadRemote)
 		return connr, nil
 	}
-	return nil, connrErr
+	return nil, err
 }
 
 // Locale is the main process of daze. In most cases, it is usually deployed
@@ -309,10 +538,10 @@ type Locale struct {
 //
 // Warning: The performance of HTTP Proxy is very poor, unless you have a good
 // reason, please use ServeSocks4 or ServeSocks5 instead. Why the poor
-// performance is that I did not implement http long connection( a well-known
-// name is KeepAlive) because It will trigger some bugs on Firefox. Firefox
-// will send traffic from different sites to the same long connection.
-// I have been debugging for a long time.
+// performance is that I did not implement http persistent connection(a
+// well-known name is KeepAlive) because It will trigger some bugs on Firefox.
+// Firefox always sends traffic from different sites to the one persistent
+// connection. I have been debugging for a long time.
 // Fuck.
 func (l *Locale) ServeProxy(connl io.ReadWriteCloser) error {
 	connlReader := bufio.NewReader(connl)
@@ -374,116 +603,130 @@ func (l *Locale) ServeProxy(connl io.ReadWriteCloser) error {
 // Serve traffic in SOCKS4/SOCKS4a format.
 //
 // Introduction:
-//   See https://en.wikipedia.org/wiki/SOCKS.
+//   See https://en.wikipedia.org/wiki/SOCKS
+//   See http://ftp.icm.edu.pl/packages/socks/socks4/SOCKS4.protocol
 func (l *Locale) ServeSocks4(connl io.ReadWriteCloser) error {
 	var (
-		buf          = make([]byte, 1024)
-		reader       = bufio.NewReader(connl)
-		dstHostBytes []byte
-		dstHost      string
-		dstPort      uint16
-		dst          string
-		connr        io.ReadWriteCloser
-		err          error
+		reader    = bufio.NewReader(connl)
+		fCode     uint8
+		fDstPort  = make([]byte, 2)
+		fDstIP    = make([]byte, 4)
+		fHostName []byte
+		dstHost   string
+		dstPort   uint16
+		dst       string
+		connr     io.ReadWriteCloser
+		err       error
 	)
-
 	connl = ReadWriteCloser{
 		Reader: reader,
 		Writer: connl,
 		Closer: connl,
 	}
-
-	io.ReadFull(connl, buf[:2])
-	io.ReadFull(connl, buf[:2])
-	dstPort = binary.BigEndian.Uint16(buf[:2])
-	io.ReadFull(connl, buf[:4])
+	reader.Discard(1)
+	fCode, _ = reader.ReadByte()
+	io.ReadFull(reader, fDstPort)
+	dstPort = binary.BigEndian.Uint16(fDstPort)
+	io.ReadFull(reader, fDstIP)
 	_, err = reader.ReadBytes(0x00)
 	if err != nil {
 		return err
 	}
-	if bytes.Equal(buf[:3], []byte{0x00, 0x00, 0x00}) && buf[3] != 0x00 {
-		dstHostBytes, err = reader.ReadBytes(0x00)
+	if bytes.Equal(fDstIP[:3], []byte{0x00, 0x00, 0x00}) && fDstIP[3] != 0x00 {
+		fHostName, err = reader.ReadBytes(0x00)
 		if err != nil {
 			return err
 		}
-		dstHost = string(dstHostBytes[:len(dstHostBytes)-1])
+		fHostName = fHostName[:len(fHostName)-1]
+		dstHost = string(fHostName)
 	} else {
-		dstHost = net.IP(buf[:4]).String()
+		dstHost = net.IP(fDstIP).String()
 	}
 	dst = dstHost + ":" + strconv.Itoa(int(dstPort))
 	log.Println("Connect[socks4]", dst)
-
-	connr, err = l.Dialer.Dial("tcp", dst)
-	if err != nil {
-		connl.Write([]byte{0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return err
+	switch fCode {
+	case 0x01:
+		connr, err = l.Dialer.Dial("tcp", dst)
+		if err != nil {
+			connl.Write([]byte{0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+			return err
+		}
+		defer connr.Close()
+		connl.Write([]byte{0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		Link(connl, connr)
+		return nil
+	case 0x02:
 	}
-	defer connr.Close()
-	connl.Write([]byte{0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-
-	Link(connl, connr)
 	return nil
 }
 
 // Serve traffic in SOCKS5 format.
 //
 // Introduction:
-//   See https://en.wikipedia.org/wiki/SOCKS.
+//   See https://en.wikipedia.org/wiki/SOCKS
 //   See https://tools.ietf.org/html/rfc1928
 func (l *Locale) ServeSocks5(connl io.ReadWriteCloser) error {
 	var (
-		buf        = make([]byte, 1024)
-		n          int
-		dstNetwork uint8
-		dstCase    uint8
-		dstHost    string
-		dstPort    uint16
-		dst        string
-		connr      io.ReadWriteCloser
-		err        error
+		reader   = bufio.NewReader(connl)
+		fN       uint8
+		fCmd     uint8
+		fAT      uint8
+		fDstAddr []byte
+		fDstPort = make([]byte, 2)
+		dstHost  string
+		dstPort  uint16
+		dst      string
+		connr    io.ReadWriteCloser
+		err      error
 	)
-
-	io.ReadFull(connl, buf[:2])
-	n = int(buf[1])
-	io.ReadFull(connl, buf[:n])
-	connl.Write([]byte{0x05, 0x00})
-	io.ReadFull(connl, buf[:4])
-	dstNetwork = buf[1]
-	dstCase = buf[3]
-	switch dstCase {
-	case 0x01:
-		io.ReadFull(connl, buf[:4])
-		dstHost = net.IP(buf[:4]).String()
-	case 0x03:
-		io.ReadFull(connl, buf[:1])
-		n = int(buf[0])
-		io.ReadFull(connl, buf[:n])
-		dstHost = string(buf[:n])
-	case 0x04:
-		io.ReadFull(connl, buf[:16])
-		dstHost = net.IP(buf[:16]).String()
+	connl = ReadWriteCloser{
+		Reader: reader,
+		Writer: connl,
+		Closer: connl,
 	}
-	_, err = io.ReadFull(connl, buf[:2])
-	if err != nil {
+	reader.Discard(1)
+	fN, _ = reader.ReadByte()
+	reader.Discard(int(fN))
+	connl.Write([]byte{0x05, 0x00})
+	reader.Discard(1)
+	fCmd, _ = reader.ReadByte()
+	reader.Discard(1)
+	fAT, _ = reader.ReadByte()
+	switch fAT {
+	case 0x01:
+		fDstAddr = make([]byte, 4)
+		io.ReadFull(reader, fDstAddr)
+		dstHost = net.IP(fDstAddr).String()
+	case 0x03:
+		fN, _ = reader.ReadByte()
+		fDstAddr = make([]byte, int(fN))
+		io.ReadFull(reader, fDstAddr)
+		dstHost = string(fDstAddr)
+	case 0x04:
+		fDstAddr = make([]byte, 16)
+		io.ReadFull(reader, fDstAddr)
+		dstHost = net.IP(fDstAddr).String()
+	}
+	if _, err = io.ReadFull(connl, fDstPort); err != nil {
 		return err
 	}
-	dstPort = binary.BigEndian.Uint16(buf[:2])
+	dstPort = binary.BigEndian.Uint16(fDstPort)
 	dst = dstHost + ":" + strconv.Itoa(int(dstPort))
 	log.Println("Connect[socks5]", dst)
-
-	if dstNetwork == 0x03 {
-		connr, err = l.Dialer.Dial("udp", dst)
-	} else {
+	switch fCmd {
+	case 0x01:
 		connr, err = l.Dialer.Dial("tcp", dst)
+		if err != nil {
+			connl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+			return err
+		}
+		defer connr.Close()
+		connl.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		Link(connl, connr)
+		return nil
+	case 0x02:
+	case 0x03:
 	}
-	if err != nil {
-		connl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return err
-	}
-	defer connr.Close()
-	connl.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-
-	Link(connl, connr)
 	return nil
 }
 
@@ -527,12 +770,12 @@ func (l *Locale) Run() error {
 			log.Println(err)
 			continue
 		}
-		go func(conn net.Conn) {
+		go func() {
 			defer conn.Close()
 			if err := l.Serve(conn); err != nil {
 				log.Println(err)
 			}
-		}(conn)
+		}()
 	}
 }
 
@@ -542,4 +785,31 @@ func NewLocale(listen string, dialer Dialer) *Locale {
 		Listen: listen,
 		Dialer: dialer,
 	}
+}
+
+var cacheData string
+
+// Data file storage path. If you want to completely remove the daze, remember
+// to empty the data directory.
+func Data() string {
+	if cacheData != "" {
+		return cacheData
+	}
+	switch {
+	case runtime.GOOS == "windows":
+		cacheData = filepath.Join(os.Getenv("localappdata"), "daze")
+	case runtime.GOOS == "linux" && runtime.GOARCH == "arm":
+		cacheData = "./data"
+	default:
+		u, _ := user.Current()
+		cacheData = filepath.Join(u.HomeDir, ".daze")
+	}
+	_, err := os.Stat(cacheData)
+	if err == nil || os.IsExist(err) {
+		return cacheData
+	}
+	if err := os.Mkdir(cacheData, 0755); err != nil {
+		log.Fatalln(err)
+	}
+	return cacheData
 }

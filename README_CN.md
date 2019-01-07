@@ -6,11 +6,15 @@ Daze 是一款帮助你连接至**互联网**的工具.
 
 # 使用
 
-使用 daze 该死的简单:
+编译或[下载](https://github.com/mohanson/daze/releases) daze:
 
 ```sh
 $ go get -u -v github.com/mohanson/daze/cmd/daze
+```
 
+使用 daze 该死的简单:
+
+```sh
 # 服务端
 # 你需要一台能正确连接互联网的机器, 并输入以下命令
 $ daze server -l 0.0.0.0:51958
@@ -37,6 +41,24 @@ Daze 可以在 **Windows**, **Linux** 和 **macOS** 下正常工作. 另外, 它
 5. 启动 daze 客户端: `cd /data/local/tmp`, `chmod +x daze`, `daze client -s $SERVER:51958 -l 127.0.0.1:51959 -dns 114.114.114.114:53`. 注意的是, 你可能需要使用 `setsid` 命令将客户端程序托管至后台运行.
 6. 设置代理: 连接任意 Wifi -> 设置 -> 代理 -> 填写 `127.0.0.1:51959`
 7. 现在, 你即可自由地访问互联网
+
+# 启用用户规则
+
+daze 使用一份名叫 RULE 的文件来管理用户自定义的过滤规则(可选的). RULE 在流量过滤器中拥有最高优先级, 因此你应该小心的使用它. 这是一份合法的 RULE 文件, 并且位于 "/tmp/rule.ls". 使用 `daze client -r /tmp/rule.ls` 来应用它.
+
+```
+F a.com b.com
+L a.com
+R b.com
+B c.com
+```
+
+- F 表示使用 b.com 替换 a.com
+- L 表示使用本地网络进行访问
+- R 表示使用代理进行访问
+- B 表示屏蔽该地址的流量
+
+支持通配符, 例如 `R *.google.com`
 
 # 了解更多
 

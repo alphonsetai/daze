@@ -6,11 +6,15 @@ Daze is a tool to help you link to the **Internet**.
 
 # Usage
 
-Daze is dead simple to use:
+Compile or [Download](https://github.com/mohanson/daze/releases) daze:
 
 ```sh
 $ go get -u -v github.com/mohanson/daze/cmd/daze
+```
 
+Daze is dead simple to use:
+
+```sh
 # server port
 # you need a machine that can access the Internet, and enter the following command:
 $ daze server -l 0.0.0.0:51958
@@ -37,6 +41,23 @@ Daze can work well on **Windows**, **Linux** and **macOS**. In additional, it ca
 5. Open daze client: `cd /data/local/tmp`, `chmod +x daze`, `daze client -s $SERVER:51958 -l 127.0.0.1:51959 -dns 114.114.114.114:53`. Attention, you may wish use `setsid` to run daze in a new session.
 6. Set the proxy for phone: WLAN -> Settings -> Proxy -> Fill in `127.0.0.1:51959`
 7. Now, you are free to visit Internet.
+
+# Use custom rules
+
+daze use a RULE file to custom your own rules(optional). RULE has the highest priority in filters, so that you should carefully maintain it. This is a RULE document located at "/tmp/rule.ls", use `daze client -r /tmp/rule.ls` to apply it.
+
+```
+F a.com b.com
+L a.com
+R b.com
+B c.com
+```
+- F(orward) means using b.com instead of a.com
+- L(ocale) means using local network
+- R(emote) means using proxy
+- B(anned) means block it
+
+Glob is supported, such as `R *.google.com`.
 
 # More
 
